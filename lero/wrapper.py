@@ -11,6 +11,7 @@ import argparse
 import json
 import os
 import pickle
+import random
 import sys
 import time
 import warnings
@@ -158,36 +159,43 @@ def is_connected_join_order(order, edges):
     return True
 
 
-def generate_connected_join_orders(aliases, edges):
+def generate_connected_join_orders(aliases, edges, candidate_limit=100):
     n = len(aliases)
     if n <= 1:
         return [tuple(aliases)]
-    if n > 6:
-        orders = [tuple(aliases), tuple(reversed(aliases))]
-        for start_idx in range(n):
-            order = [start_idx]
-            remaining = set(range(n)) - {start_idx}
-            while remaining:
-                found = False
-                for r in sorted(remaining):
-                    if tuple(sorted([r, order[-1]])) in edges:
-                        order.append(r)
-                        remaining.remove(r)
-                        found = True
-                        break
-                if not found:
-                    r = min(remaining)
-                    order.append(r)
-                    remaining.remove(r)
-            t = tuple(aliases[i] for i in order)
-            if t not in orders:
-                orders.append(t)
-        return orders
-    all_orders = []
-    for perm in permutations(range(n)):
-        if is_connected_join_order(perm, edges):
-            all_orders.append(tuple(aliases[i] for i in perm))
-    return all_orders
+    if n <= 6:
+        all_orders = []
+        for perm in permutations(range(n)):
+            if is_connected_join_order(perm, edges):
+                all_orders.append(tuple(aliases[i] for i in perm))
+        return all_orders
+
+    # For n > 6: randomized sampling of connected join orders
+    orders = []
+    seen = set()
+    # deterministic: always include the original order
+    original = tuple(range(n))
+    if is_connected_join_order(original, edges):
+        t = tuple(aliases[i] for i in original)
+        orders.append(t)
+        seen.add(original)
+
+    max_attempts = candidate_limit * 10
+    attempts = 0
+    base = list(range(n))
+    while len(orders) < candidate_limit and attempts < max_attempts:
+        perm = base[:]
+        random.shuffle(perm)
+        perm_t = tuple(perm)
+        if perm_t not in seen and is_connected_join_order(perm_t, edges):
+            seen.add(perm_t)
+            orders.append(tuple(aliases[i] for i in perm))
+        attempts += 1
+
+    if not orders:
+        orders = [tuple(aliases)]
+
+    return orders
 
 
 def load_replay_buffer(model_dir):
