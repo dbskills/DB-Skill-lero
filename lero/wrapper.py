@@ -1,14 +1,21 @@
 #!/usr/bin/env python3
 """
-Lero Query Optimizer Skill Wrapper
-Uses the Lero model to score candidate plans generated via pg_hint_plan
-Leading hints with connected join orders. Uses PostgreSQL cost estimates
-as primary filter and Lero model score as tiebreaker.
+Lero Query Optimizer Skill Wrapper — Online Training Edition
+
+Generates candidate plans via pg_hint_plan Leading hints with connected join
+orders. In training mode, executes plans with EXPLAIN ANALYZE, collects actual
+latencies, and fine-tunes the Lero model online. State is persisted across
+invocations (model weights, replay buffer).
+
+Usage:
+    python wrapper.py --dsn <DSN> --query <SQL>            # training mode
+    python wrapper.py --dsn <DSN> --query <SQL> --optimize-only  # inference-only
 """
 
 import argparse
 import json
 import os
+import pickle
 import re
 import sys
 import time
@@ -24,13 +31,20 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Lero Query Optimizer")
     parser.add_argument("--dsn", required=True, help="Database connection string")
     parser.add_argument("--query", required=True, help="SQL query to optimize")
-    parser.add_argument("--config", required=False, help="Model configuration path")
+    parser.add_argument("--config", required=False, help="Model directory path")
     parser.add_argument("--optimize-only", action="store_true",
-                        help="Optimize-only mode: bypass actual query execution")
+                        help="Inference-only: skip query execution and training")
     return parser.parse_args()
 
 
-def get_explain_plan(dsn, query, hint_str=""):
+def get_model_dir(args):
+    if args.config:
+        return args.config
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(script_dir, "reproduce", "imdb_pw")
+
+
+def explain_plan(dsn, query, hint_str=""):
     conn = psycopg2.connect(dsn)
     conn.set_client_encoding('UTF8')
     try:
@@ -45,6 +59,27 @@ def get_explain_plan(dsn, query, hint_str=""):
         if isinstance(result, list) and len(result) == 2:
             result = [result[1]]
         return json.dumps(result)
+    finally:
+        conn.close()
+
+
+def explain_analyze(dsn, query, hint_str=""):
+    conn = psycopg2.connect(dsn)
+    conn.set_client_encoding('UTF8')
+    try:
+        cur = conn.cursor()
+        cur.execute("SET statement_timeout TO 300000")
+        sql = query.strip().rstrip(';').strip()
+        if hint_str:
+            sql = f"/*+ {hint_str} */ EXPLAIN (ANALYZE, TIMING, VERBOSE, COSTS, SUMMARY, FORMAT JSON) {sql}"
+        else:
+            sql = f"EXPLAIN (ANALYZE, TIMING, VERBOSE, COSTS, SUMMARY, FORMAT JSON) {sql}"
+        cur.execute(sql)
+        result = cur.fetchone()[0]
+        if isinstance(result, list) and len(result) == 2:
+            result = [result[1]]
+        plan_obj = result[0]
+        return json.dumps(result), plan_obj["Execution Time"]
     finally:
         conn.close()
 
@@ -124,12 +159,7 @@ def is_connected_join_order(order, edges):
         return True
     joined = {order[0]}
     for t in order[1:]:
-        can_join = False
-        for j in joined:
-            if tuple(sorted([t, j])) in edges:
-                can_join = True
-                break
-        if not can_join:
+        if not any(tuple(sorted([t, j])) in edges for j in joined):
             return False
         joined.add(t)
     return True
@@ -139,10 +169,8 @@ def generate_connected_join_orders(aliases, edges):
     n = len(aliases)
     if n <= 1:
         return [tuple(aliases)]
-
     if n > 6:
-        orders = [tuple(aliases)]
-        orders.append(tuple(reversed(aliases)))
+        orders = [tuple(aliases), tuple(reversed(aliases))]
         for start_idx in range(n):
             order = [start_idx]
             remaining = set(range(n)) - {start_idx}
@@ -162,7 +190,6 @@ def generate_connected_join_orders(aliases, edges):
             if t not in orders:
                 orders.append(t)
         return orders
-
     all_orders = []
     for perm in permutations(range(n)):
         if is_connected_join_order(perm, edges):
@@ -170,9 +197,23 @@ def generate_connected_join_orders(aliases, edges):
     return all_orders
 
 
-def run_optimize(dsn, query, model_path, optimize_only):
+def load_replay_buffer(model_dir):
+    path = os.path.join(model_dir, "replay_buffer.pkl")
+    if os.path.exists(path):
+        with open(path, "rb") as f:
+            return pickle.load(f)
+    return []
+
+
+def save_replay_buffer(model_dir, buffer):
+    path = os.path.join(model_dir, "replay_buffer.pkl")
+    with open(path, "wb") as f:
+        pickle.dump(buffer, f)
+
+
+def run_optimize(dsn, query, model_dir, optimize_only):
     model = LeroModel(None)
-    model.load(model_path)
+    model.load(model_dir)
     fg = model._feature_generator
 
     start_time = time.time()
@@ -193,47 +234,60 @@ def run_optimize(dsn, query, model_path, optimize_only):
         }
 
     join_orders = generate_connected_join_orders(aliases, edges)
+    candidates = [("", tuple(aliases))] + [
+        (f"Leading({' '.join(order)})", order) for order in join_orders
+    ]
 
-    # Evaluate all candidates
-    candidates = []
+    if optimize_only:
+        # Inference-only: score plans with model
+        best_hint = ""
+        best_score = float("inf")
+        default_score = None
 
-    # Default plan
-    try:
-        plan_json = get_explain_plan(dsn, query)
-        plan_obj = json.loads(plan_json)
-        default_cost = plan_obj[0]['Plan']['Total Cost']
-        features, _ = fg.transform([plan_json])
-        pred = model.predict(features)
-        default_score = float(pred[0][0])
-        candidates.append({
-            'hint': '',
-            'cost': default_cost,
-            'score': default_score,
-            'plan_json': plan_json
-        })
-    except Exception as e:
-        print(f"Warning: default plan evaluation failed: {e}", file=sys.stderr)
-        default_cost = float('inf')
-        default_score = float('inf')
+        for hint, _ in candidates:
+            try:
+                plan_json = explain_plan(dsn, query, hint)
+                features, _ = fg.transform([plan_json])
+                score = float(model.predict(features)[0][0])
+                if hint == "":
+                    default_score = score
+                if score < best_score:
+                    best_score = score
+                    best_hint = hint
+            except Exception:
+                continue
 
-    # Evaluate Leading hints
-    for order in join_orders:
-        hint = f"Leading({' '.join(order)})"
+        elapsed = time.time() - start_time
+        optimized_query = f"/*+ {best_hint} */ {query}" if best_hint else query
+
+        estimated_impact = 0.0
+        if default_score is not None and default_score > 0 and best_score < default_score:
+            estimated_impact = ((default_score - best_score) / default_score) * 100
+
+        return {
+            "optimized_query": optimized_query,
+            "metadata": {
+                "strategy_type": "learning-to-rank",
+                "optimization_time": round(elapsed, 6),
+                "estimated_impact": round(max(0.0, estimated_impact), 2),
+                "best_score": round(best_score, 4),
+                "num_candidates": len(candidates),
+                "mode": "inference-only",
+            }
+        }
+
+    # Training mode: execute plans, collect latencies, train
+    plan_data = []
+
+    for hint, _ in candidates:
         try:
-            plan_json = get_explain_plan(dsn, query, hint)
-            plan_obj = json.loads(plan_json)
-            features, _ = fg.transform([plan_json])
-            pred = model.predict(features)
-            candidates.append({
-                'hint': hint,
-                'cost': plan_obj[0]['Plan']['Total Cost'],
-                'score': float(pred[0][0]),
-                'plan_json': plan_json
-            })
-        except Exception:
+            plan_json, latency = explain_analyze(dsn, query, hint)
+            plan_data.append((hint, latency, plan_json))
+        except Exception as e:
+            print(f"Warning: plan execution failed for '{hint or 'default'}': {e}", file=sys.stderr)
             continue
 
-    if not candidates:
+    if not plan_data:
         elapsed = time.time() - start_time
         return {
             "optimized_query": query,
@@ -241,46 +295,63 @@ def run_optimize(dsn, query, model_path, optimize_only):
                 "strategy_type": "learning-to-rank",
                 "optimization_time": round(elapsed, 6),
                 "estimated_impact": 0.0,
-                "error": "No candidate plans could be evaluated"
+                "error": "No plan could be executed"
             }
         }
 
-    # Filter candidates: only keep those with cost <= default_cost * 1.1
-    if default_cost != float('inf'):
-        cost_threshold = default_cost * 1.1
-        viable = [c for c in candidates if c['cost'] <= cost_threshold]
-    else:
-        viable = candidates
+    # Find the best plan by actual latency
+    best_entry = min(plan_data, key=lambda x: x[1])
+    best_hint = best_entry[0]
+    best_latency = best_entry[1]
+    default_entry = next((e for e in plan_data if e[0] == ""), plan_data[0])
+    default_latency = default_entry[1]
 
-    if not viable:
-        viable = candidates  # fallback: use all if none are viable
+    # Collect training data: use fg.transform() to get normalized latencies
+    X_train = []
+    Y_train = []
+    for hint, raw_latency, plan_json in plan_data:
+        try:
+            features, y_norm = fg.transform([plan_json])
+            X_train.append(features[0])
+            Y_train.append(float(y_norm[0]))
+        except Exception:
+            continue
 
-    # Among viable candidates, select the one with lowest model score
-    best = min(viable, key=lambda c: c['score'])
+    # Fine-tune model if we have enough data
+    if len(X_train) >= 2:
+        try:
+            model.fit(X_train, Y_train, pre_training=True)
+            model.save(model_dir)
+            print(f"Model fine-tuned on {len(X_train)} plans and saved", file=sys.stderr)
+        except Exception as e:
+            print(f"Warning: model fine-tuning failed: {e}", file=sys.stderr)
+
+    # Persist replay buffer
+    replay = load_replay_buffer(model_dir)
+    for hint, latency, plan_json in plan_data:
+        replay.append((latency, plan_json))
+    if len(replay) > 1000:
+        replay = replay[-1000:]
+    save_replay_buffer(model_dir, replay)
 
     elapsed = time.time() - start_time
 
-    if best['hint']:
-        optimized_query = f"/*+ {best['hint']} */ {query}"
-    else:
-        optimized_query = query
-
+    optimized_query = f"/*+ {best_hint} */ {query}" if best_hint else query
     estimated_impact = 0.0
-    if default_score and default_score > 0 and best['score'] < default_score:
-        estimated_impact = ((default_score - best['score']) / default_score) * 100
+    if default_latency > 0 and best_latency < default_latency:
+        estimated_impact = ((default_latency - best_latency) / default_latency) * 100
 
     metadata = {
         "strategy_type": "learning-to-rank",
         "optimization_time": round(elapsed, 6),
         "estimated_impact": round(max(0.0, estimated_impact), 2),
-        "best_score": round(best['score'], 4),
-        "num_candidates": len(candidates),
-        "num_viable": len(viable),
+        "best_latency_ms": round(best_latency, 2),
+        "default_latency_ms": round(default_latency, 2),
+        "num_candidates": len(plan_data),
+        "mode": "online-training",
     }
-    if default_score != float('inf'):
-        metadata["default_score"] = round(default_score, 4)
-    if best['hint']:
-        metadata["best_hint"] = best['hint']
+    if best_hint:
+        metadata["best_hint"] = best_hint
 
     return {
         "optimized_query": optimized_query,
@@ -290,19 +361,15 @@ def run_optimize(dsn, query, model_path, optimize_only):
 
 def main():
     args = parse_args()
+    model_dir = get_model_dir(args)
 
-    model_path = args.config
-    if not model_path:
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        model_path = os.path.join(script_dir, "reproduce", "imdb_pw")
-
-    if not os.path.exists(os.path.join(model_path, "nn_weights")):
+    if not os.path.exists(os.path.join(model_dir, "nn_weights")):
         print(json.dumps({
-            "error": f"Model not found at {model_path}. Use --config."
+            "error": f"Model not found at {model_dir}. Use --config."
         }))
         sys.exit(1)
 
-    result = run_optimize(args.dsn, args.query, model_path, args.optimize_only)
+    result = run_optimize(args.dsn, args.query, model_dir, args.optimize_only)
     print(json.dumps(result))
 
 
