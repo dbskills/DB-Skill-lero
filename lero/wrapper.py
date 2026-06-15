@@ -1,25 +1,26 @@
 #!/usr/bin/env python3
-"""
-Lero Query Optimizer Skill Wrapper — Online Training Edition
+"""Lero Query Optimizer Skill Wrapper.
 
 Generates candidate plans via pg_hint_plan Leading hints with connected join
 orders. In training mode, executes plans with EXPLAIN ANALYZE, collects actual
 latencies, and fine-tunes the Lero model online. State is persisted across
 invocations (model weights, replay buffer).
-
-Usage:
-    python wrapper.py --dsn <DSN> --query <SQL>            # training mode
-    python wrapper.py --dsn <DSN> --query <SQL> --optimize-only  # inference-only
 """
 
 import argparse
 import json
+import logging
 import os
 import pickle
 import re
 import sys
 import time
+import warnings
+from contextlib import redirect_stdout
+from io import StringIO
 from itertools import permutations
+
+warnings.filterwarnings("ignore")
 
 import psycopg2
 
@@ -239,7 +240,6 @@ def run_optimize(dsn, query, model_dir, optimize_only):
     ]
 
     if optimize_only:
-        # Inference-only: score plans with model
         best_hint = ""
         best_score = float("inf")
         default_score = None
@@ -299,16 +299,13 @@ def run_optimize(dsn, query, model_dir, optimize_only):
             }
         }
 
-    # Find the best plan by actual latency
     best_entry = min(plan_data, key=lambda x: x[1])
     best_hint = best_entry[0]
     best_latency = best_entry[1]
     default_entry = next((e for e in plan_data if e[0] == ""), plan_data[0])
     default_latency = default_entry[1]
 
-    # Collect training data: use fg.transform() to get normalized latencies
-    X_train = []
-    Y_train = []
+    X_train, Y_train = [], []
     for hint, raw_latency, plan_json in plan_data:
         try:
             features, y_norm = fg.transform([plan_json])
@@ -317,16 +314,15 @@ def run_optimize(dsn, query, model_dir, optimize_only):
         except Exception:
             continue
 
-    # Fine-tune model if we have enough data
     if len(X_train) >= 2:
         try:
-            model.fit(X_train, Y_train, pre_training=True)
+            f = StringIO()
+            with redirect_stdout(f):
+                model.fit(X_train, Y_train, pre_training=True)
             model.save(model_dir)
-            print(f"Model fine-tuned on {len(X_train)} plans and saved", file=sys.stderr)
         except Exception as e:
             print(f"Warning: model fine-tuning failed: {e}", file=sys.stderr)
 
-    # Persist replay buffer
     replay = load_replay_buffer(model_dir)
     for hint, latency, plan_json in plan_data:
         replay.append((latency, plan_json))
