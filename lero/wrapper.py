@@ -9,10 +9,8 @@ invocations (model weights, replay buffer).
 
 import argparse
 import json
-import logging
 import os
 import pickle
-import re
 import sys
 import time
 import warnings
@@ -23,6 +21,8 @@ from itertools import permutations
 warnings.filterwarnings("ignore")
 
 import psycopg2
+import sqlglot
+from sqlglot import exp
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from model import LeroModel
@@ -41,8 +41,7 @@ def parse_args():
 def get_model_dir(args):
     if args.config:
         return args.config
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(script_dir, "reproduce", "imdb_pw")
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "reproduce", "imdb_pw")
 
 
 def explain_plan(dsn, query, hint_str=""):
@@ -79,78 +78,71 @@ def explain_analyze(dsn, query, hint_str=""):
         result = cur.fetchone()[0]
         if isinstance(result, list) and len(result) == 2:
             result = [result[1]]
-        plan_obj = result[0]
-        return json.dumps(result), plan_obj["Execution Time"]
+        return json.dumps(result), result[0]["Execution Time"]
     finally:
         conn.close()
 
 
 def extract_join_graph(query):
-    q = re.sub(r'--.*?$', '', query, flags=re.MULTILINE)
-    q = re.sub(r'/\*.*?\*/', '', q, flags=re.DOTALL)
-    q = ' '.join(q.split())
-
-    from_match = re.search(
-        r'\bFROM\b\s+(.+?)(?:\bWHERE\b|\bGROUP\b|\bHAVING\b|\bORDER\b|\bLIMIT\b|\bUNION\b|;|$)',
-        q, re.IGNORECASE | re.DOTALL
-    )
-    if not from_match:
+    """Extract table aliases and join edges using sqlglot."""
+    tree = sqlglot.parse_one(query)
+    if not isinstance(tree, exp.Select):
         return [], []
 
-    from_clause = from_match.group(1)
-    where_clause = ""
-    where_match = re.search(
-        r'\bWHERE\b\s+(.+?)(?:\bGROUP\b|\bHAVING\b|\bORDER\b|\bLIMIT\b|\bUNION\b|;|$)',
-        q, re.IGNORECASE | re.DOTALL
-    )
-    if where_match:
-        where_clause = where_match.group(1)
-
-    parts = []
-    depth = 0
-    current = ""
-    for ch in from_clause:
-        if ch == '(':
-            depth += 1
-        elif ch == ')':
-            depth -= 1
-        if ch == ',' and depth == 0:
-            parts.append(current.strip())
-            current = ""
-        else:
-            current += ch
-    if current.strip():
-        parts.append(current.strip())
-
     aliases = []
-    for part in parts:
-        if '(' in part:
-            m = re.search(r'(?:AS\s+)?(\w+)\s*$', part, re.IGNORECASE)
-            if m:
-                aliases.append(m.group(1).lower())
-            continue
-        tokens = part.split()
-        if not tokens:
-            continue
-        if len(tokens) == 1:
-            aliases.append(tokens[0].lower())
-        elif len(tokens) >= 2:
-            if tokens[-2].upper() == 'AS':
-                aliases.append(tokens[-1].lower())
-            else:
-                aliases.append(tokens[-1].lower())
+    alias_set = set()
 
-    alias_set = set(aliases)
+    from_clause = tree.args.get('from_')
+    if from_clause:
+        src = from_clause.this
+        if isinstance(src, exp.Table):
+            a = src.alias_or_name
+            aliases.append(a)
+            alias_set.add(a)
+        elif isinstance(src, exp.Subquery):
+            a = src.alias_or_name
+            if a:
+                aliases.append(a)
+                alias_set.add(a)
+
+    joins = tree.args.get('joins') or []
+    for join in joins:
+        src = join.this
+        if isinstance(src, exp.Table):
+            a = src.alias_or_name
+            if a not in alias_set:
+                aliases.append(a)
+                alias_set.add(a)
+        elif isinstance(src, exp.Subquery):
+            a = src.alias_or_name
+            if a and a not in alias_set:
+                aliases.append(a)
+                alias_set.add(a)
+
     edges = set()
-    join_pattern = re.findall(
-        r'(\w+)\.\w+\s*=\s*(\w+)\.\w+',
-        where_clause, re.IGNORECASE
-    )
-    for a1, a2 in join_pattern:
-        a1, a2 = a1.lower(), a2.lower()
-        if a1 in alias_set and a2 in alias_set and a1 != a2:
-            edge = tuple(sorted([aliases.index(a1), aliases.index(a2)]))
-            edges.add(edge)
+
+    def add_edge(col_a, col_b):
+        if col_a.table and col_b.table:
+            a1, a2 = col_a.table.lower(), col_b.table.lower()
+            if a1 in alias_set and a2 in alias_set and a1 != a2:
+                edges.add(tuple(sorted([aliases.index(a1), aliases.index(a2)])))
+
+    where = tree.args.get('where')
+    if where:
+        for node in where.walk():
+            if isinstance(node, exp.EQ):
+                left, right = node.left, node.right
+                if isinstance(left, exp.Column) and isinstance(right, exp.Column):
+                    add_edge(left, right)
+
+    for join in joins:
+        on = join.args.get('on')
+        if on:
+            for node in on.walk():
+                if isinstance(node, exp.EQ):
+                    left, right = node.left, node.right
+                    if isinstance(left, exp.Column) and isinstance(right, exp.Column):
+                        add_edge(left, right)
 
     return aliases, list(edges)
 
@@ -276,9 +268,8 @@ def run_optimize(dsn, query, model_dir, optimize_only):
             }
         }
 
-    # Training mode: execute plans, collect latencies, train
+    # Training mode
     plan_data = []
-
     for hint, _ in candidates:
         try:
             plan_json, latency = explain_analyze(dsn, query, hint)
