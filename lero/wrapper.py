@@ -170,26 +170,47 @@ def generate_connected_join_orders(aliases, edges, candidate_limit=100):
                 all_orders.append(tuple(aliases[i] for i in perm))
         return all_orders
 
-    # For n > 6: randomized sampling of connected join orders
+    # For n > 6: constructive random sampling from the frontier.
+    # Each step picks the next table from the set of tables adjacent to the
+    # already-joined set, guaranteeing connectedness on every attempt.
+    adj = [set() for _ in range(n)]
+    for u, v in edges:
+        adj[u].add(v)
+        adj[v].add(u)
+
     orders = []
     seen = set()
-    # deterministic: always include the original order
     original = tuple(range(n))
     if is_connected_join_order(original, edges):
-        t = tuple(aliases[i] for i in original)
-        orders.append(t)
+        orders.append(tuple(aliases[i] for i in original))
         seen.add(original)
 
-    max_attempts = candidate_limit * 10
+    # If the original order isn't connected, the graph is disconnected — no
+    # connected orders exist, so return early without wasting attempts.
+    if not orders and not any(adj[i] for i in range(n)):
+        return [tuple(aliases)]
+
     attempts = 0
-    base = list(range(n))
-    while len(orders) < candidate_limit and attempts < max_attempts:
-        perm = base[:]
-        random.shuffle(perm)
-        perm_t = tuple(perm)
-        if perm_t not in seen and is_connected_join_order(perm_t, edges):
-            seen.add(perm_t)
-            orders.append(tuple(aliases[i] for i in perm))
+    while len(orders) < candidate_limit and attempts < candidate_limit * 10:
+        start = random.randrange(n)
+        order = [start]
+        joined = {start}
+        frontier = set(adj[start])
+
+        while len(order) < n:
+            if not frontier:
+                break
+            nxt = random.choice(list(frontier))
+            frontier.discard(nxt)
+            order.append(nxt)
+            joined.add(nxt)
+            frontier.update(adj[nxt] - joined)
+
+        if len(order) == n:
+            perm_t = tuple(order)
+            if perm_t not in seen:
+                seen.add(perm_t)
+                orders.append(tuple(aliases[i] for i in perm_t))
         attempts += 1
 
     if not orders:
