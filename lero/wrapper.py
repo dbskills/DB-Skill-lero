@@ -93,32 +93,48 @@ def extract_join_graph(query):
     aliases = []
     alias_set = set()
 
-    from_clause = tree.args.get('from_')
-    if from_clause:
-        src = from_clause.this
+    def _collect_tables(src):
         if isinstance(src, exp.Table):
-            a = src.alias_or_name
-            aliases.append(a)
-            alias_set.add(a)
-        elif isinstance(src, exp.Subquery):
-            a = src.alias_or_name
-            if a:
-                aliases.append(a)
-                alias_set.add(a)
-
-    joins = tree.args.get('joins') or []
-    for join in joins:
-        src = join.this
-        if isinstance(src, exp.Table):
-            a = src.alias_or_name
-            if a not in alias_set:
-                aliases.append(a)
-                alias_set.add(a)
-        elif isinstance(src, exp.Subquery):
-            a = src.alias_or_name
+            a = src.alias_or_name.lower()
             if a and a not in alias_set:
                 aliases.append(a)
                 alias_set.add(a)
+        elif isinstance(src, exp.Subquery):
+            if isinstance(src.this, exp.Select):
+                a = src.alias_or_name.lower()
+                if a and a not in alias_set:
+                    aliases.append(a)
+                    alias_set.add(a)
+            elif isinstance(src.this, exp.Table):
+                a = src.alias_or_name.lower()
+                if a:
+                    if a not in alias_set:
+                        aliases.append(a)
+                        alias_set.add(a)
+                else:
+                    _collect_tables(src.this)
+
+    def _walk_joins(join_list):
+        for join in join_list:
+            src = join.this
+            _collect_tables(src)
+            if isinstance(src, exp.Table):
+                _walk_joins(src.args.get('joins') or [])
+            elif isinstance(src, exp.Subquery) and isinstance(src.this, exp.Table):
+                if not src.alias_or_name:
+                    _walk_joins(src.this.args.get('joins') or [])
+
+    from_clause = tree.args.get('from_')
+    if from_clause:
+        _collect_tables(from_clause.this)
+        src = from_clause.this
+        if isinstance(src, exp.Table):
+            _walk_joins(src.args.get('joins') or [])
+        elif isinstance(src, exp.Subquery) and isinstance(src.this, exp.Table):
+            if not src.alias_or_name:
+                _walk_joins(src.this.args.get('joins') or [])
+
+    _walk_joins(tree.args.get('joins') or [])
 
     edges = set()
 
@@ -128,6 +144,22 @@ def extract_join_graph(query):
             if a1 in alias_set and a2 in alias_set and a1 != a2:
                 edges.add(tuple(sorted([aliases.index(a1), aliases.index(a2)])))
 
+    def _collect_join_edges(join_node):
+        on = join_node.args.get('on')
+        if on:
+            for node in on.walk():
+                if isinstance(node, exp.EQ):
+                    left, right = node.left, node.right
+                    if isinstance(left, exp.Column) and isinstance(right, exp.Column):
+                        add_edge(left, right)
+        src = join_node.this
+        if isinstance(src, exp.Subquery) and isinstance(src.this, exp.Table):
+            for j in (src.this.args.get('joins') or []):
+                _collect_join_edges(j)
+        elif isinstance(src, exp.Table):
+            for j in (src.args.get('joins') or []):
+                _collect_join_edges(j)
+
     where = tree.args.get('where')
     if where:
         for node in where.walk():
@@ -136,14 +168,9 @@ def extract_join_graph(query):
                 if isinstance(left, exp.Column) and isinstance(right, exp.Column):
                     add_edge(left, right)
 
+    joins = tree.args.get('joins') or []
     for join in joins:
-        on = join.args.get('on')
-        if on:
-            for node in on.walk():
-                if isinstance(node, exp.EQ):
-                    left, right = node.left, node.right
-                    if isinstance(left, exp.Column) and isinstance(right, exp.Column):
-                        add_edge(left, right)
+        _collect_join_edges(join)
 
     return aliases, list(edges)
 
@@ -219,18 +246,25 @@ def generate_connected_join_orders(aliases, edges, candidate_limit=100):
     return orders
 
 
+REPLAY_CAP = 1000
+TRAIN_TRIGGER = 100
+
+
 def load_replay_buffer(model_dir):
     path = os.path.join(model_dir, "replay_buffer.pkl")
     if os.path.exists(path):
         with open(path, "rb") as f:
-            return pickle.load(f)
-    return []
+            data = pickle.load(f)
+        if isinstance(data, tuple) and len(data) == 2:
+            return data
+        return 0, data
+    return 0, []
 
 
-def save_replay_buffer(model_dir, buffer):
+def save_replay_buffer(model_dir, trained_count, buffer):
     path = os.path.join(model_dir, "replay_buffer.pkl")
     with open(path, "wb") as f:
-        pickle.dump(buffer, f)
+        pickle.dump((trained_count, buffer), f)
 
 
 def run_optimize(dsn, query, model_dir, optimize_only):
@@ -260,73 +294,69 @@ def run_optimize(dsn, query, model_dir, optimize_only):
         (f"Leading({' '.join(order)})", order) for order in join_orders
     ]
 
+    # Score all candidates via EXPLAIN (costs only).
+    best_hint = ""
+    best_score = float("inf")
+    default_score = None
+
+    for hint, _ in candidates:
+        try:
+            plan_json = explain_plan(dsn, query, hint)
+            features, _ = fg.transform([plan_json])
+            score = float(model.predict(features)[0][0])
+            if hint == "":
+                default_score = score
+            if score < best_score:
+                best_score = score
+                best_hint = hint
+        except Exception:
+            continue
+
+    elapsed = time.time() - start_time
+    optimized_query = f"/*+ {best_hint} */ {query}" if best_hint else query
+
+    estimated_impact = 0.0
+    if default_score is not None and default_score > 0 and best_score < default_score:
+        estimated_impact = ((default_score - best_score) / default_score) * 100
+    estimated_impact = round(max(0.0, estimated_impact), 2)
+
     if optimize_only:
-        best_hint = ""
-        best_score = float("inf")
-        default_score = None
-
-        for hint, _ in candidates:
-            try:
-                plan_json = explain_plan(dsn, query, hint)
-                features, _ = fg.transform([plan_json])
-                score = float(model.predict(features)[0][0])
-                if hint == "":
-                    default_score = score
-                if score < best_score:
-                    best_score = score
-                    best_hint = hint
-            except Exception:
-                continue
-
-        elapsed = time.time() - start_time
-        optimized_query = f"/*+ {best_hint} */ {query}" if best_hint else query
-
-        estimated_impact = 0.0
-        if default_score is not None and default_score > 0 and best_score < default_score:
-            estimated_impact = ((default_score - best_score) / default_score) * 100
-
         return {
             "optimized_query": optimized_query,
             "metadata": {
                 "strategy_type": "learning-to-rank",
                 "optimization_time": round(elapsed, 6),
-                "estimated_impact": round(max(0.0, estimated_impact), 2),
+                "estimated_impact": estimated_impact,
                 "best_score": round(best_score, 4),
                 "num_candidates": len(candidates),
                 "mode": "inference-only",
             }
         }
 
-    # Training mode
-    plan_data = []
-    for hint, _ in candidates:
-        try:
-            plan_json, latency = explain_analyze(dsn, query, hint)
-            plan_data.append((hint, latency, plan_json))
-        except Exception as e:
-            print(f"Warning: plan execution failed for '{hint or 'default'}': {e}", file=sys.stderr)
-            continue
-
-    if not plan_data:
-        elapsed = time.time() - start_time
+    # Training mode: execute only the best plan via EXPLAIN ANALYZE.
+    try:
+        plan_json, best_latency = explain_analyze(dsn, query, best_hint)
+    except Exception as e:
         return {
             "optimized_query": query,
             "metadata": {
                 "strategy_type": "learning-to-rank",
-                "optimization_time": round(elapsed, 6),
+                "optimization_time": round(time.time() - start_time, 6),
                 "estimated_impact": 0.0,
-                "error": "No plan could be executed"
+                "error": f"Best plan execution failed: {e}"
             }
         }
 
-    best_entry = min(plan_data, key=lambda x: x[1])
-    best_hint = best_entry[0]
-    best_latency = best_entry[1]
-    default_entry = next((e for e in plan_data if e[0] == ""), plan_data[0])
-    default_latency = default_entry[1]
+    trained_count, replay = load_replay_buffer(model_dir)
+    replay.append((best_latency, plan_json))
+    if len(replay) > REPLAY_CAP:
+        removed = len(replay) - REPLAY_CAP
+        replay = replay[-REPLAY_CAP:]
+        trained_count = max(0, trained_count - removed)
 
     X_train, Y_train = [], []
-    for hint, raw_latency, plan_json in plan_data:
+    untrained = replay[trained_count:]
+    for _, plan_json in untrained:
         try:
             features, y_norm = fg.transform([plan_json])
             X_train.append(features[0])
@@ -334,44 +364,29 @@ def run_optimize(dsn, query, model_dir, optimize_only):
         except Exception:
             continue
 
-    if len(X_train) >= 2:
+    if len(untrained) >= TRAIN_TRIGGER and len(X_train) >= 2:
         try:
             f = StringIO()
             with redirect_stdout(f):
                 model.fit(X_train, Y_train, pre_training=True)
             model.save(model_dir)
+            trained_count = len(replay)
         except Exception as e:
             print(f"Warning: model fine-tuning failed: {e}", file=sys.stderr)
 
-    replay = load_replay_buffer(model_dir)
-    for hint, latency, plan_json in plan_data:
-        replay.append((latency, plan_json))
-    if len(replay) > 1000:
-        replay = replay[-1000:]
-    save_replay_buffer(model_dir, replay)
-
-    elapsed = time.time() - start_time
-
-    optimized_query = f"/*+ {best_hint} */ {query}" if best_hint else query
-    estimated_impact = 0.0
-    if default_latency > 0 and best_latency < default_latency:
-        estimated_impact = ((default_latency - best_latency) / default_latency) * 100
-
-    metadata = {
-        "strategy_type": "learning-to-rank",
-        "optimization_time": round(elapsed, 6),
-        "estimated_impact": round(max(0.0, estimated_impact), 2),
-        "best_latency_ms": round(best_latency, 2),
-        "default_latency_ms": round(default_latency, 2),
-        "num_candidates": len(plan_data),
-        "mode": "online-training",
-    }
-    if best_hint:
-        metadata["best_hint"] = best_hint
+    save_replay_buffer(model_dir, trained_count, replay)
 
     return {
         "optimized_query": optimized_query,
-        "metadata": metadata
+        "metadata": {
+            "strategy_type": "learning-to-rank",
+            "optimization_time": round(time.time() - start_time, 6),
+            "estimated_impact": estimated_impact,
+            "best_latency_ms": round(best_latency, 2),
+            "num_candidates": len(candidates),
+            "mode": "online-training",
+            "best_hint": best_hint,
+        }
     }
 
 
