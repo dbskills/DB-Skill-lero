@@ -354,25 +354,26 @@ def run_optimize(dsn, query, model_dir, optimize_only):
         replay = replay[-REPLAY_CAP:]
         trained_count = max(0, trained_count - removed)
 
-    X_train, Y_train = [], []
-    untrained = replay[trained_count:]
-    for _, plan_json in untrained:
-        try:
-            features, y_norm = fg.transform([plan_json])
-            X_train.append(features[0])
-            Y_train.append(float(y_norm[0]))
-        except Exception:
-            continue
+    untrained = len(replay) - trained_count
+    if untrained >= TRAIN_TRIGGER:
+        X_train, Y_train = [], []
+        for _, plan_json in replay:
+            try:
+                features, y_norm = fg.transform([plan_json])
+                X_train.append(features[0])
+                Y_train.append(float(y_norm[0]))
+            except Exception:
+                continue
 
-    if len(untrained) >= TRAIN_TRIGGER and len(X_train) >= 2:
-        try:
-            f = StringIO()
-            with redirect_stdout(f):
-                model.fit(X_train, Y_train, pre_training=True)
-            model.save(model_dir)
-            trained_count = len(replay)
-        except Exception as e:
-            print(f"Warning: model fine-tuning failed: {e}", file=sys.stderr)
+        if len(X_train) >= 2:
+            try:
+                f = StringIO()
+                with redirect_stdout(f):
+                    model.fit(X_train, Y_train, pre_training=True)
+                model.save(model_dir)
+                trained_count = len(replay)
+            except Exception as e:
+                print(f"Warning: model fine-tuning failed: {e}", file=sys.stderr)
 
     save_replay_buffer(model_dir, trained_count, replay)
 
