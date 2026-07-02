@@ -8,3 +8,7 @@ lero/dump_card_with_score.txt
 __pycache__
 .ipynb*
 lero/test_script/*log*
+# Runtime state for parallel-invocation safety (created at runtime)
+lero/reproduce/imdb_pw/state.lock
+lero/reproduce/imdb_pw/replay_buffer.pkl
+lero/reproduce/imdb_pw/*.tmp.*

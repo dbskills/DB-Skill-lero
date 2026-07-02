@@ -5,9 +5,16 @@ Generates candidate plans via pg_hint_plan Leading hints with connected join
 orders. In training mode, executes plans with EXPLAIN ANALYZE, collects actual
 latencies, and fine-tunes the Lero model online. State is persisted across
 invocations (model weights, replay buffer).
+
+Concurrency: persistent state (model weights + replay buffer) is guarded by a
+file lock so that parallel wrapper invocations cannot corrupt each other's
+writes or read half-written files. Scoring loads the model under a *shared*
+lock (parallel reads); the training critical section runs under an *exclusive*
+lock (serialized mutation). See acquire_lock()/release_lock().
 """
 
 import argparse
+import fcntl
 import json
 import os
 import pickle
@@ -249,6 +256,49 @@ def generate_connected_join_orders(aliases, edges, candidate_limit=100):
 REPLAY_CAP = 1000
 TRAIN_TRIGGER = 100
 
+# Name of the lock file used to coordinate parallel invocations. A process
+# holds a shared (LOCK_SH) lock while reading model files for scoring, and an
+# exclusive (LOCK_EX) lock while mutating persistent state (replay buffer +
+# model weights). fcntl.flock locks are per-fd and auto-released on process
+# exit, so a crashed process never leaves a stuck lock.
+LOCK_FILENAME = "state.lock"
+
+
+def acquire_lock(model_dir, exclusive, timeout=300):
+    """Acquire a file lock on model_dir/state.lock.
+
+    shared (exclusive=False): for read-only model loading. Multiple scoring
+        processes may hold this concurrently.
+    exclusive (exclusive=True): for the state-mutation critical section. Only
+        one process may hold it, and not while any shared lock is held.
+
+    Blocks (polling) until acquired or `timeout` seconds elapse. Returns the
+    open lock file descriptor; pass it to release_lock().
+    """
+    os.makedirs(model_dir, exist_ok=True)
+    path = os.path.join(model_dir, LOCK_FILENAME)
+    fd = open(path, "w")
+    flag = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+    deadline = time.time() + timeout
+    while True:
+        try:
+            fcntl.flock(fd, flag | fcntl.LOCK_NB)
+            return fd
+        except (BlockingIOError, OSError):
+            if time.time() > deadline:
+                fd.close()
+                kind = "exclusive" if exclusive else "shared"
+                raise TimeoutError(
+                    f"Timed out waiting for {kind} lock on {path}")
+            time.sleep(0.1)
+
+
+def release_lock(fd):
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        fd.close()
+
 
 def load_replay_buffer(model_dir):
     path = os.path.join(model_dir, "replay_buffer.pkl")
@@ -262,14 +312,26 @@ def load_replay_buffer(model_dir):
 
 
 def save_replay_buffer(model_dir, trained_count, buffer):
+    # Atomic write: serialize to a temp file then os.replace() into place.
+    # Combined with the exclusive lock this guarantees no concurrent reader
+    # ever sees a partially-written buffer (and survives a crash mid-write).
     path = os.path.join(model_dir, "replay_buffer.pkl")
-    with open(path, "wb") as f:
+    tmp = path + f".tmp.{os.getpid()}"
+    with open(tmp, "wb") as f:
         pickle.dump((trained_count, buffer), f)
+    os.replace(tmp, path)
 
 
 def run_optimize(dsn, query, model_dir, optimize_only):
-    model = LeroModel(None)
-    model.load(model_dir)
+    # Load the model under a SHARED lock so a concurrent training process
+    # (which holds the exclusive lock while saving) cannot write model files
+    # mid-load. Multiple scoring processes may load in parallel.
+    lock_fd = acquire_lock(model_dir, exclusive=False)
+    try:
+        model = LeroModel(None)
+        model.load(model_dir)
+    finally:
+        release_lock(lock_fd)
     fg = model._feature_generator
 
     start_time = time.time()
@@ -334,6 +396,8 @@ def run_optimize(dsn, query, model_dir, optimize_only):
         }
 
     # Training mode: execute only the best plan via EXPLAIN ANALYZE.
+    # This DB execution is read-only w.r.t. local state and may run in
+    # parallel with other invocations' scoring/execution.
     try:
         plan_json, best_latency = explain_analyze(dsn, query, best_hint)
     except Exception as e:
@@ -347,35 +411,49 @@ def run_optimize(dsn, query, model_dir, optimize_only):
             }
         }
 
-    trained_count, replay = load_replay_buffer(model_dir)
-    replay.append((best_latency, plan_json))
-    if len(replay) > REPLAY_CAP:
-        removed = len(replay) - REPLAY_CAP
-        replay = replay[-REPLAY_CAP:]
-        trained_count = max(0, trained_count - removed)
+    # Critical section: mutate persistent state under an EXCLUSIVE lock so
+    # parallel invocations serialize their appends/trains/saves. Reload the
+    # replay buffer (and, when training, the model) fresh from disk inside
+    # the lock so we build on the latest state rather than the snapshot taken
+    # at scoring time — this prevents lost updates when processes overlap.
+    lock_fd = acquire_lock(model_dir, exclusive=True)
+    try:
+        trained_count, replay = load_replay_buffer(model_dir)
+        replay.append((best_latency, plan_json))
+        if len(replay) > REPLAY_CAP:
+            removed = len(replay) - REPLAY_CAP
+            replay = replay[-REPLAY_CAP:]
+            trained_count = max(0, trained_count - removed)
 
-    untrained = len(replay) - trained_count
-    if untrained >= TRAIN_TRIGGER:
-        X_train, Y_train = [], []
-        for _, plan_json in replay:
-            try:
-                features, y_norm = fg.transform([plan_json])
-                X_train.append(features[0])
-                Y_train.append(float(y_norm[0]))
-            except Exception:
-                continue
+        untrained = len(replay) - trained_count
+        if untrained >= TRAIN_TRIGGER:
+            # Reload the model fresh: another process may have fine-tuned and
+            # saved since we loaded for scoring.
+            train_model = LeroModel(None)
+            train_model.load(model_dir)
+            train_fg = train_model._feature_generator
+            X_train, Y_train = [], []
+            for _, plan_json in replay:
+                try:
+                    features, y_norm = train_fg.transform([plan_json])
+                    X_train.append(features[0])
+                    Y_train.append(float(y_norm[0]))
+                except Exception:
+                    continue
 
-        if len(X_train) >= 2:
-            try:
-                f = StringIO()
-                with redirect_stdout(f):
-                    model.fit(X_train, Y_train, pre_training=True)
-                model.save(model_dir)
-                trained_count = len(replay)
-            except Exception as e:
-                print(f"Warning: model fine-tuning failed: {e}", file=sys.stderr)
+            if len(X_train) >= 2:
+                try:
+                    f = StringIO()
+                    with redirect_stdout(f):
+                        train_model.fit(X_train, Y_train, pre_training=True)
+                    train_model.save(model_dir)
+                    trained_count = len(replay)
+                except Exception as e:
+                    print(f"Warning: model fine-tuning failed: {e}", file=sys.stderr)
 
-    save_replay_buffer(model_dir, trained_count, replay)
+        save_replay_buffer(model_dir, trained_count, replay)
+    finally:
+        release_lock(lock_fd)
 
     return {
         "optimized_query": optimized_query,
