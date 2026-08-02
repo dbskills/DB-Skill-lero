@@ -82,6 +82,45 @@ def _cost_ratio_too_high(chosen_cost, default_cost, max_ratio=_MAX_COST_RATIO):
         return False
 
 
+def _strip_subplan_children(plan):
+    """Drop 'SubPlan'/'InitPlan' children (Parent Relationship) from a plan
+    tree. PG attaches an uncorrelated scalar subquery (e.g. TPC-H Q2
+    `col = (select min(...))`) as such a child of a join node, making it
+    3+-ary; the GCN feature parser asserts a binary plan tree. These are
+    constant scalar-subquery results, not real join children, so dropping
+    them doesn't affect join-order ranking. Accepts a JSON string (lero's
+    _explain_plan form), a [plan_dict] list, or a plan_dict; returns the
+    same form, unchanged on any parse error."""
+    was_string = isinstance(plan, str)
+    try:
+        parsed = json.loads(plan) if was_string else plan
+    except Exception:
+        return plan
+    root = parsed
+    if isinstance(root, list) and root and isinstance(root[0], dict):
+        root = root[0]
+    if isinstance(root, dict) and "Plan" in root:
+        def _walk(n):
+            if "Plans" not in n:
+                return
+            kids = n["Plans"]
+            kept = [c for c in kids
+                    if c.get("Parent Relationship") not in ("SubPlan", "InitPlan")]
+            if kept:
+                n["Plans"] = kept
+                for c in kept:
+                    _walk(c)
+            else:
+                # Drop empty/now-empty Plans: PG emits a bare "Plans": [] on
+                # some scan leaves (e.g. parallel-aware Index Scan); the tree
+                # featurizer asserts len(children) > 0 when 'Plans' is
+                # present -> bare AssertionError(). Treat as a leaf.
+                del n["Plans"]
+        _walk(root["Plan"])
+    return json.dumps(parsed) if was_string else parsed
+
+
+
 # --------------------------------------------------------------------------- #
 # DB connection pool: reuses psycopg2 connections across EXPLAIN calls.
 # --------------------------------------------------------------------------- #
@@ -149,7 +188,38 @@ class ConnectionPool:
 # --------------------------------------------------------------------------- #
 # Join-graph extraction and candidate generation (schema-agnostic).
 # --------------------------------------------------------------------------- #
-def extract_join_graph(query):
+def _fetch_schema_columns(dsn):
+    """Fetch {table_name: set(column_names)} from pg_catalog."""
+    try:
+        conn = psycopg2.connect(dsn)
+    except Exception:
+        return {}
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT c.relname, a.attname
+            FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            JOIN pg_attribute a ON a.attrelid = c.oid
+            WHERE c.relkind = 'r'
+              AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+              AND a.attnum > 0 AND NOT a.attisdropped
+        """)
+        tables = {}
+        for relname, attname in cur.fetchall():
+            tables.setdefault(relname, set()).add(attname)
+        cur.close()
+        return tables
+    except Exception:
+        return {}
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def extract_join_graph(query, schema_columns=None):
     tree = sqlglot.parse_one(query)
     if not isinstance(tree, exp.Select):
         return [], []
@@ -157,84 +227,47 @@ def extract_join_graph(query):
     aliases = []
     alias_set = set()
 
-    def _collect_tables(src):
-        if isinstance(src, exp.Table):
-            a = src.alias_or_name.lower()
+    # Base tables across the FROM clause and JOINs. find_all descends into
+    # derived-table subqueries so their inner tables become Leading targets;
+    # a derived-table alias (exp.Subquery) is not a base Table so it's skipped.
+    from_clause = tree.args.get('from_')
+    if from_clause:
+        for t in from_clause.find_all(exp.Table):
+            a = t.alias_or_name.lower()
             if a and a not in alias_set:
                 aliases.append(a)
                 alias_set.add(a)
-        elif isinstance(src, exp.Subquery):
-            if isinstance(src.this, exp.Select):
-                a = src.alias_or_name.lower()
-                if a and a not in alias_set:
-                    aliases.append(a)
-                    alias_set.add(a)
-            elif isinstance(src.this, exp.Table):
-                a = src.alias_or_name.lower()
-                if a:
-                    if a not in alias_set:
-                        aliases.append(a)
-                        alias_set.add(a)
-                else:
-                    _collect_tables(src.this)
-
-    def _walk_joins(join_list):
-        for join in join_list:
-            src = join.this
-            _collect_tables(src)
-            if isinstance(src, exp.Table):
-                _walk_joins(src.args.get('joins') or [])
-            elif isinstance(src, exp.Subquery) and isinstance(src.this, exp.Table):
-                if not src.alias_or_name:
-                    _walk_joins(src.this.args.get('joins') or [])
-
-    from_clause = tree.args.get('from_')
-    if from_clause:
-        _collect_tables(from_clause.this)
-        src = from_clause.this
-        if isinstance(src, exp.Table):
-            _walk_joins(src.args.get('joins') or [])
-        elif isinstance(src, exp.Subquery) and isinstance(src.this, exp.Table):
-            if not src.alias_or_name:
-                _walk_joins(src.this.args.get('joins') or [])
-
-    _walk_joins(tree.args.get('joins') or [])
+    for join in tree.find_all(exp.Join):
+        for t in join.find_all(exp.Table):
+            a = t.alias_or_name.lower()
+            if a and a not in alias_set:
+                aliases.append(a)
+                alias_set.add(a)
 
     edges = set()
+    _sc = schema_columns or {}
+
+    def _resolve_col(col):
+        if col.table:
+            return col.table.lower()
+        for _alias in aliases:
+            if col.name in _sc.get(_alias, ()):
+                return _alias
+        return None
 
     def add_edge(col_a, col_b):
-        if col_a.table and col_b.table:
-            a1, a2 = col_a.table.lower(), col_b.table.lower()
-            if a1 in alias_set and a2 in alias_set and a1 != a2:
-                edges.add(tuple(sorted([aliases.index(a1), aliases.index(a2)])))
+        a1 = _resolve_col(col_a)
+        a2 = _resolve_col(col_b)
+        if a1 and a2 and a1 in alias_set and a2 in alias_set and a1 != a2:
+            edges.add(tuple(sorted([aliases.index(a1), aliases.index(a2)])))
 
-    def _collect_join_edges(join_node):
-        on = join_node.args.get('on')
-        if on:
-            for node in on.walk():
-                if isinstance(node, exp.EQ):
-                    left, right = node.left, node.right
-                    if isinstance(left, exp.Column) and isinstance(right, exp.Column):
-                        add_edge(left, right)
-        src = join_node.this
-        if isinstance(src, exp.Subquery) and isinstance(src.this, exp.Table):
-            for j in (src.this.args.get('joins') or []):
-                _collect_join_edges(j)
-        elif isinstance(src, exp.Table):
-            for j in (src.args.get('joins') or []):
-                _collect_join_edges(j)
-
-    where = tree.args.get('where')
-    if where:
-        for node in where.walk():
-            if isinstance(node, exp.EQ):
-                left, right = node.left, node.right
-                if isinstance(left, exp.Column) and isinstance(right, exp.Column):
-                    add_edge(left, right)
-
-    joins = tree.args.get('joins') or []
-    for join in joins:
-        _collect_join_edges(join)
+    # Join-predicate EQ pairs across the whole query (incl. inside derived
+    # tables). add_edge drops pairs referencing tables not in the FROM, e.g.
+    # EXISTS-subquery tables, so they don't masquerade as outer joins.
+    for eq in tree.find_all(exp.EQ):
+        left, right = eq.left, eq.right
+        if isinstance(left, exp.Column) and isinstance(right, exp.Column):
+            add_edge(left, right)
 
     return aliases, list(edges)
 
@@ -332,7 +365,7 @@ def run_training(model_dir):
     X, Y = [], []
     for _, pj in replay:
         try:
-            features, y_norm = fg.transform([pj])
+            features, y_norm = fg.transform([_strip_subplan_children(pj)])
             X.append(features[0])
             Y.append(float(y_norm[0]))
         except Exception:
@@ -381,6 +414,8 @@ class LeroSkill:
         self.replay_cap = REPLAY_CAP_DEFAULT
         self.train_trigger = TRAIN_TRIGGER_DEFAULT
         self.candidate_limit = CANDIDATE_LIMIT_DEFAULT
+        # Per-DSN schema cache for bare-column resolution.
+        self._schema_cols_cache = {}
         # _state_lock guards replay-buffer append/persist + the training-spawn
         # flag. It is never held on the optimize critical path.
         self._state_lock = threading.Lock()
@@ -520,6 +555,11 @@ class LeroSkill:
                 pool.discard(dsn, conn)
 
     # -- Critical path (lock-free) --
+    def _schema_columns_for(self, dsn):
+        if dsn not in self._schema_cols_cache:
+            self._schema_cols_cache[dsn] = _fetch_schema_columns(dsn)
+        return self._schema_cols_cache[dsn]
+
     def optimize(self, dsn, query, optimize_only):
         self._maybe_reload_model()
         start_time = time.time()
@@ -533,10 +573,11 @@ class LeroSkill:
                     "optimization_time": round(time.time() - start_time, 6),
                     "estimated_impact": 0.0,
                     "error": "model not loaded",
+                    "model_dir": self.model_dir,
                 },
             }
 
-        aliases, edges = extract_join_graph(query)
+        aliases, edges = extract_join_graph(query, self._schema_columns_for(dsn))
         if len(aliases) < 2:
             return {
                 "optimized_query": query,
@@ -546,6 +587,7 @@ class LeroSkill:
                     "estimated_impact": 0.0,
                     "note": "Single-table query, no optimization needed",
                     "mode": "inference-only" if optimize_only else "online-training",
+                    "model_dir": self.model_dir,
                 },
             }
 
@@ -587,7 +629,7 @@ class LeroSkill:
                          if not _cost_ratio_too_high(_plan_total_cost(plan_jsons[i]), default_cost)]
         if valid_idx:
             try:
-                features, _ = fg.transform([plan_jsons[i] for i in valid_idx])
+                features, _ = fg.transform([_strip_subplan_children(plan_jsons[i]) for i in valid_idx])
                 scores = model.predict(features)
                 for j, i in enumerate(valid_idx):
                     try:
@@ -620,6 +662,7 @@ class LeroSkill:
                 "num_candidates": len(candidates),
                 "mode": mode,
                 "best_hint": best_hint,
+                "model_dir": self.model_dir,
             },
         }
 
